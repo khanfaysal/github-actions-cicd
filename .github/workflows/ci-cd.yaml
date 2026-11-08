@@ -1,0 +1,170 @@
+name: Node.js CI/CD to AWS EC2
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: cicd-demo
+  APP_DIR_NAME: node-cicd-app
+
+jobs:
+  ci:
+    name: Lint, Test and Health Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Lint
+        run: npm run lint
+
+      - name: Run Tests
+        run: npm test
+
+      - name: Start Application
+        run: |
+          HOST=127.0.0.1 PORT=3000 nohup npm start > app.log 2>&1 &
+          echo $! > app.pid
+
+      - name: Application Health Check
+        run: |
+          for i in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:3000/health; then
+              echo
+              echo "Application is healthy!"
+              exit 0
+            fi
+            echo "Waiting for application... ($i/30)"
+            sleep 2
+          done
+          echo "Application failed health check"
+          cat app.log
+          exit 1
+
+      - name: Stop Application
+        if: always()
+        run: |
+          if [ -f app.pid ]; then
+            kill "$(cat app.pid)" 2>/dev/null || true
+          fi
+
+  deploy:
+    name: Deploy to AWS EC2
+    runs-on: ubuntu-latest
+    needs: ci
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    timeout-minutes: 10
+    environment: production
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_HOST_FINGERPRINT: ${{ vars.EC2_HOST_FINGERPRINT }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+
+          test -n "$EC2_HOST_FINGERPRINT" || {
+            echo "Set EC2_HOST_FINGERPRINT repository variable"
+            exit 1
+          }
+
+          ssh-keyscan -t ed25519 -H "$EC2_HOST" > ~/.ssh/known_hosts 2>/dev/null
+
+          ssh-keygen -lf ~/.ssh/known_hosts -E sha256 \
+            | grep -F "$EC2_HOST_FINGERPRINT" || {
+              echo "EC2 SSH host fingerprint mismatch"
+              exit 1
+            }
+
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Package Application
+        run: |
+          tar --exclude=.git \
+              --exclude=.github \
+              --exclude=node_modules \
+              --exclude=app.log \
+              --exclude=app.pid \
+              -czf /tmp/app.tar.gz .
+
+      - name: Copy Application to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          scp -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            /tmp/app.tar.gz \
+            "$EC2_USER@$EC2_HOST:/tmp/app.tar.gz"
+
+      - name: Deploy and Restart Application
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "APP_NAME=$APP_NAME APP_DIR_NAME=$APP_DIR_NAME bash -se" <<'EOF'
+          set -euo pipefail
+
+          APP_DIR="$HOME/$APP_DIR_NAME"
+          mkdir -p "$APP_DIR"
+
+          # Remove old files but keep node_modules for faster installs
+          find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name node_modules -exec rm -rf {} +
+
+          tar -xzf /tmp/app.tar.gz -C "$APP_DIR"
+          rm -f /tmp/app.tar.gz
+
+          cd "$APP_DIR"
+          npm ci --omit=dev
+
+          sudo systemctl restart "$APP_NAME"
+
+          echo "Waiting for EC2 application..."
+          for i in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:3000/health; then
+              echo
+              echo "EC2 deployment successful!"
+              exit 0
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 2
+          done
+
+          echo "EC2 deployment health check failed"
+          sudo journalctl -u "$APP_NAME" -n 50 --no-pager
+          exit 1
+          EOF
